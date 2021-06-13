@@ -11,6 +11,5 @@ Coded by J. de la Cruz Rodriguez (ISP-SU 2021).
 We follow the implementation described in de la Cruz Rodriguez et al. (2019),
 but for the moment without regularization.
 
-If you find this code useful for your research, I would appreciate the most a citation to:
-* [de la Cruz Rodriguez et al. (2019)](https://ui.adsabs.harvard.edu/abs/2019A%26A...623A..74D/abstract)
+If you find this code useful for your research, I would appreciate the most a citation to [de la Cruz Rodriguez et al. (2019)](https://ui.adsabs.harvard.edu/abs/2019A%26A...623A..74D/abstract).
 
