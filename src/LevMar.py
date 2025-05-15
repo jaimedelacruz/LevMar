@@ -1,6 +1,5 @@
 """
 Levenberg Marquart fitting class and helper tools
-https://github.com/jaimedelacruz/LevMar
 
 Coded by J. de la Cruz Rodriguez (ISP-SU 2021)
 
@@ -17,13 +16,12 @@ Marquardt (1963)
 
 Dependences: NumPy
 
-Modifications history:
-   2021-07-8, JdlCR: added SVD_thres to reject small singular values.
-                     Bugfix in autoderivatives scaling
+Modification history:
+    2025-05-14: Fixed scaling of authoderivatives and
+                allowed to fix parameter values in Pinfo.
+                Also implemented external svd_thres value.
+    
 
-
-TODO:
-1) Implement handling of cyclic variables.
 """
 
 import numpy as np
@@ -35,12 +33,13 @@ class Pinfo:
     Helper class to store parameter scaling norms and limits
     Methods: checkLimits, scale, normalize
     """
-    def __init__(self, scale = 1.0, min = None, max = None, is_cyclic = 0):
+    def __init__(self, scale = 1.0, min = None, max = None, is_cyclic = 0, is_fixed = 0):
         self.scl = scale
         self.min = min
         self.max = max
         self.is_cyclic  = is_cyclic
-
+        self.is_fixed = is_fixed
+        
     # --------------------------------------------------
 
     def checkLimits(self, value):
@@ -153,8 +152,6 @@ def _eval_fx(fx, x, pinfo, udat, auto_derivatives = False, get_J = False):
     
     status = ScalePars(xtmp, pinfo)
 
-    #print("kk", xtmp.size)
-    #print(xtmp)
     
     if(get_J):
 
@@ -163,33 +160,37 @@ def _eval_fx(fx, x, pinfo, udat, auto_derivatives = False, get_J = False):
         # automatically. Keep your fingers crossed
         #
         if(auto_derivatives):
-            dpar = 0.001
+            dpar = 1.E-4
             syn = fx(xtmp, udat)
             
             nObs = syn.size
             J   = np.zeros((nPar, nObs), dtype='float64')
 
             for ii in range(nPar):
-                xtmp = np.copy(x)
-                xtmp[ii] += dpar
-                status = ScalePars(xtmp, pinfo)
-                left = fx(xtmp, udat)
                 
-                xtmp = np.copy(x)
-                xtmp[ii] -= dpar
-                status = ScalePars(xtmp, pinfo)
-                right = fx(xtmp, udat)
-
-                J[ii] = (left - right) / (2*dpar*pinfo[ii].scl)
+                if(not pinfo[ii].is_fixed):
+                    xtmp = np.copy(x)
+                    xtmp[ii] += dpar
+                    status = ScalePars(xtmp, pinfo)
+                    left = fx(xtmp, udat)
+                    
+                    xtmp = np.copy(x)
+                    xtmp[ii] -= dpar
+                    status = ScalePars(xtmp, pinfo)
+                    right = fx(xtmp, udat)
+                    
+                    J[ii] = (left - right) / (2*dpar*pinfo[ii].scl)
                 
         else: # The user provides derivatives
             syn, J = fx(xtmp, udat, get_J=get_J)
+
         return syn, J
 
     else:
         #
         # No derivatives are requested
         #
+
         return fx(xtmp, udat)
         
 # *******************************************************
@@ -204,10 +205,12 @@ def _getResidue(syn, o, s, pinfo, J = None):
     nPar = len(pinfo)
     nDat = o.size
     
-    scl = np.sqrt(1.0/nDat) / s # Includes the noise estimate!
-    res = scl * (o-syn) 
-        
+    scl = np.sqrt(1.0/nDat)
+    res = scl * (o-syn) / s
+    
+    
     if(J is not None):
+        scl = scl/s
         for pp in range(nPar):
             J[pp] *= scl * pinfo[pp].scl
             
@@ -238,32 +241,32 @@ def _checkLambda(lamb, lmin, lmax, lstep):
     
 # *******************************************************
 
-def _solveLinearSVD(A,b, svd_thres = None):
+def _solveLinearSVD(A,b, svd_thres = 1.e-14):
     """
     Resolution of a linear system of equation using SVD
     TODO: Singular value filtering for small values below
     svd_thres
     """
     U,s,Vh = np.linalg.svd(A)
+    sthr = np.max(np.abs(s))*svd_thres
 
-    if(svd_thres is not None):
-        ithr = np.abs(s).max() * svd_thres
-        for ii in range(len(s)):
-            if(s[ii] >= ithr):
-                s[ii] = 1.0 / s[ii]
-            else:
-                s[ii] = 0.0
-    else:
-        s = 1.0 / s
+    # thresholding of singular values
     
+    for ii in range(s.size):
+        if(np.abs(s[ii]) < sthr):
+            s[ii] = 0.0
+        else:
+            s[ii] = 1.0 / s[ii]
+        
     c = np.dot(U.T,np.transpose(b))
     w = np.dot(np.diag(s),c)
     x = np.dot(Vh.conj().T,w)
+    
     return x
 
 # *******************************************************
 
-def _computeNew(J, res, x, lamb, pinfo, svd_thres=None):
+def _computeNew(Jin, res, x, lamb, pinfo, svd_thres=1.e-14):
     """
     Helper function that computes the correction
     to the current estimate of the model for a given
@@ -272,21 +275,44 @@ def _computeNew(J, res, x, lamb, pinfo, svd_thres=None):
     # Allocate linear system terms
     # A = J.T * J, where A is a symmetric matrix
     # b = J.T * res, where b is a vector
-    
-    nPar, nDat = J.shape
-    A = np.zeros((nPar,nPar), dtype='float64')
-    b = np.zeros((nPar), dtype='float64')
 
-    for jj in range(nPar):
+    nPar, nDat = Jin.shape
+
+    
+    # extract the Jacobian from non-fixed parameters
+    
+    nfree = 0
+    for ii in range(nPar):
+        if(pinfo[ii].is_fixed == 0):
+            nfree += 1
+            
+    J = np.zeros((nfree,nDat))
+
+    k = 0
+    for ii in range(nPar):
+        if(pinfo[ii].is_fixed == 0):
+            J[k] = Jin[ii]
+            k += 1
+
+
+    # Create arrays to store the Hessian and RHS
+    
+    A = np.zeros((nfree,nfree), dtype='float64')
+    b = np.zeros((nfree), dtype='float64')
+
+
+    
+    
+    for jj in range(nfree):
         
         # Evaluate b = J.T * res
-        b[jj] = (J[jj] * res).sum() 
+        b[jj] = (J[jj] * res).sum()
         
-        for ii in range(jj,nPar): # Remember, it is sym!
+        for ii in range(jj,nfree): # Remember, it is sym!
 
             # Evaluate A = J.T * J
             tmp =  (J[jj]*J[ii]).sum()
-            
+                
             A[jj,ii] = tmp
             A[ii,jj] = tmp 
 
@@ -294,8 +320,22 @@ def _computeNew(J, res, x, lamb, pinfo, svd_thres=None):
         
         A[jj,jj] *= (1.0 + lamb)
 
+        
     # Solve linear system for correction
-    dx = _solveLinearSVD(A, b, svd_thres=svd_thres)
+    
+    dx_sub = _solveLinearSVD(A, b, svd_thres=svd_thres)
+
+    
+    # insert correction for non-fixed parameters into a nPar-size array
+    
+    k=0
+    dx = np.zeros(nPar)
+    
+    for ii in range(nPar):
+        if(pinfo[ii].is_fixed == 0):
+            dx[ii] = dx_sub[k]
+            k+=1
+
     
     # Add correction to the current estimate of the model
     xnew = x + dx
@@ -311,7 +351,7 @@ def _computeNew(J, res, x, lamb, pinfo, svd_thres=None):
 # *******************************************************
 
 def _getNewEstimate(fx, x, o, s, res, pinfo, udat, lamb, J, lmin, lmax, \
-                    lstep, auto_derivatives = False, svd_thres = None):    
+                    lstep, auto_derivatives = False, svd_thres=1.e-14):    
     """
     Wrapper helper function that computes a new estimate of the model
     and evaluates Chi2 for this estimate for a given J, res and lambda 
@@ -335,7 +375,7 @@ def _getNewEstimate(fx, x, o, s, res, pinfo, udat, lamb, J, lmin, lmax, \
 
 def LevMar(fx, par_in, obs_in, sig_in, pinfo, udat, Niter = 20, init_lambda=10.0, \
            lmin = 1.e-4, lmax=1.e4, lstep = 10**0.5, chi2_thres=1.0, \
-           fx_thres=0.001, auto_derivatives = False, verbose = True, n_reject_max = 6,
+           fx_thres=0.001, auto_derivatives = False, verbose = True, n_reject_max = 4,\
            svd_thres = 1.e-14):
     """
     Levenberg-Marquard based fitting routine for non-linear models
@@ -359,7 +399,8 @@ def LevMar(fx, par_in, obs_in, sig_in, pinfo, udat, Niter = 20, init_lambda=10.0
 auto_derivatives: Compute the derivatives automatically using centered finite differences (True/False default)
          verbose: Print iteration information
     n_reject_max: maximum number of consecutive rejected iterations before stopping the iterations. The lambda parameter will be increased after each rejection.
-       svd_thres: SVD threshold to reject small singular values. We use s.max() * svd_thres as a limit value. Typically 1.e-14 for double prec calculations.
+       svd_thres: sets the cutoff threshold for setting singular values to zero.
+     
     """
     nam = "LevMar: "
     
@@ -388,8 +429,6 @@ auto_derivatives: Compute the derivatives automatically using centered finite di
     # Get first evaluation of Chi2 and init Jacobian
     #
     syn, J  = _eval_fx(fx, x, pinfo, udat, auto_derivatives=auto_derivatives, get_J = True)
-    bestJ   = np.copy(J)
-    Jsave   = np.copy(J)
     res     = _getResidue(syn, o, s, pinfo, J = J)
 
     bestChi2 = _getChi2(res)
@@ -417,7 +456,6 @@ auto_derivatives: Compute the derivatives automatically using centered finite di
         if(chi2 < bestChi2):
             bestChi2 = chi2*1
             best_x = np.copy(xnew)
-            bestJ  = np.copy(Jsave)
             n_rejected = 0
 
             olamb = lamb*1
@@ -447,7 +485,6 @@ auto_derivatives: Compute the derivatives automatically using centered finite di
             # Update J and res
             x = np.copy(best_x)
             syn, J = _eval_fx(fx, x, pinfo, udat, auto_derivatives=auto_derivatives, get_J = True)
-            Jsave  = np.copy(J)
             res    = _getResidue(syn, o, s, pinfo, J = J)
             
         else:
@@ -476,7 +513,7 @@ auto_derivatives: Compute the derivatives automatically using centered finite di
     #
     # Get synthetic and derivatives
     #
-    syn = _eval_fx(fx, np.copy(best_x), pinfo, udat, auto_derivatives=auto_derivatives, get_J = False)
+    syn, J = _eval_fx(fx, np.copy(best_x), pinfo, udat, auto_derivatives=auto_derivatives, get_J = True)
     status = ScalePars(best_x, pinfo)
 
-    return bestChi2, best_x, syn, bestJ
+    return bestChi2, best_x, syn, J
